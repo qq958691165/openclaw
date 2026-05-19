@@ -1,12 +1,24 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import {
+  testing as conversationBindingTesting,
+  registerSessionBindingAdapter,
+  type SessionBindingAdapter,
+} from "openclaw/plugin-sdk/conversation-runtime";
 import { resolveThreadSessionKeys } from "openclaw/plugin-sdk/routing";
-import { describe, expect, it } from "vitest";
-import { resolveTelegramConversationBaseSessionKey } from "./conversation-route.js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  resolveTelegramConversationBaseSessionKey,
+  resolveTelegramConversationRoute,
+} from "./conversation-route.js";
 
 describe("resolveTelegramConversationBaseSessionKey", () => {
   const cfg: OpenClawConfig = {};
 
-  it("uses a per-account key for default-account DMs", () => {
+  beforeEach(() => {
+    conversationBindingTesting.resetSessionBindingAdaptersForTests();
+  });
+
+  it("keeps default-account DMs on the route session key", () => {
     expect(
       resolveTelegramConversationBaseSessionKey({
         cfg,
@@ -20,7 +32,34 @@ describe("resolveTelegramConversationBaseSessionKey", () => {
         isGroup: false,
         senderId: 12345,
       }),
-    ).toBe("agent:main:telegram:default:direct:12345");
+    ).toBe("agent:main:main");
+  });
+
+  it("keeps configured default-account DMs on the route session key", () => {
+    expect(
+      resolveTelegramConversationBaseSessionKey({
+        cfg: {
+          channels: {
+            telegram: {
+              defaultAccount: "work",
+              accounts: {
+                work: {},
+                personal: {},
+              },
+            },
+          },
+        },
+        route: {
+          agentId: "main",
+          accountId: "work",
+          matchedBy: "default",
+          sessionKey: "agent:main:main",
+        },
+        chatId: 12345,
+        isGroup: false,
+        senderId: 12345,
+      }),
+    ).toBe("agent:main:main");
   });
 
   it("uses the per-account fallback key for named-account DMs without an explicit binding", () => {
@@ -77,5 +116,46 @@ describe("resolveTelegramConversationBaseSessionKey", () => {
         threadId: "12345:99",
       }).sessionKey,
     ).toBe("agent:main:telegram:personal:direct:12345:thread:12345:99");
+  });
+
+  it("keeps inbound DMs on the main route when a stale runtime binding points at a cron run", () => {
+    const touch = vi.fn<NonNullable<SessionBindingAdapter["touch"]>>();
+    registerSessionBindingAdapter({
+      channel: "telegram",
+      accountId: "default",
+      listBySession: () => [],
+      resolveByConversation: () => ({
+        bindingId: "binding-cron-run",
+        targetSessionKey: "agent:youtube:cron:monthly-report:run:closed-run-1",
+        targetKind: "session",
+        conversation: {
+          channel: "telegram",
+          accountId: "default",
+          conversationId: "12345",
+        },
+        status: "active",
+        boundAt: 1,
+      }),
+      touch,
+    });
+
+    const result = resolveTelegramConversationRoute({
+      cfg: {
+        session: {
+          dmScope: "main",
+        },
+      },
+      accountId: "default",
+      chatId: 12345,
+      isGroup: false,
+      senderId: 12345,
+    });
+
+    expect(touch).not.toHaveBeenCalled();
+    expect(result.configuredBinding).toBeNull();
+    expect(result.configuredBindingSessionKey).toBe("");
+    expect(result.route.agentId).toBe("main");
+    expect(result.route.sessionKey).toBe("agent:main:main");
+    expect(result.route.matchedBy).toBe("default");
   });
 });

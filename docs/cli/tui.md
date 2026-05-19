@@ -5,7 +5,7 @@ read_when:
   - You want to pass url/token/session from scripts
   - You want to run the TUI in local embedded mode without a Gateway
   - You want to use openclaw chat or openclaw tui --local
-title: "tui"
+title: "TUI"
 ---
 
 # `openclaw tui`
@@ -17,6 +17,23 @@ Related:
 
 - TUI guide: [TUI](/web/tui)
 
+## Options
+
+| Flag                  | Default                                   | Description                                                                        |
+| --------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------- |
+| `--local`             | `false`                                   | Run against the local embedded agent runtime instead of a Gateway.                 |
+| `--url <url>`         | `gateway.remote.url` from config          | Gateway WebSocket URL.                                                             |
+| `--token <token>`     | (none)                                    | Gateway token if required.                                                         |
+| `--password <pass>`   | (none)                                    | Gateway password if required.                                                      |
+| `--session <key>`     | `main` (or `global` when scope is global) | Session key. Inside an agent workspace it auto-selects that agent unless prefixed. |
+| `--deliver`           | `false`                                   | Deliver assistant replies through configured channels.                             |
+| `--thinking <level>`  | (model default)                           | Thinking level override.                                                           |
+| `--message <text>`    | (none)                                    | Send an initial message after connecting.                                          |
+| `--timeout-ms <ms>`   | `agents.defaults.timeoutSeconds`          | Agent timeout. Invalid values log a warning and are ignored.                       |
+| `--history-limit <n>` | `200`                                     | History entries to load on attach.                                                 |
+
+Aliases: `openclaw chat` and `openclaw terminal` invoke the same command with `--local` implied.
+
 Notes:
 
 - `chat` and `terminal` are aliases for `openclaw tui --local`.
@@ -25,6 +42,7 @@ Notes:
 - When launched from inside a configured agent workspace directory, TUI auto-selects that agent for the session key default (unless `--session` is explicitly `agent:<id>:...`).
 - Local mode uses the embedded agent runtime directly. Most local tools work, but Gateway-only features are unavailable.
 - Local mode adds `/auth [provider]` inside the TUI command surface.
+- Plugin approval gates still apply in local mode. Tools that require approval prompt for a decision in the terminal; nothing is silently auto-approved because the Gateway is not involved.
 
 ## Examples
 
@@ -64,3 +82,8 @@ Then inside the TUI:
 
 Apply targeted fixes with `openclaw config set` or `openclaw configure`, then
 rerun `openclaw config validate`. See [TUI](/web/tui) and [Config](/cli/config).
+
+## Related
+
+- [CLI reference](/cli)
+- [TUI](/web/tui)

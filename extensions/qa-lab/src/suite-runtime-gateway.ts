@@ -65,8 +65,30 @@ async function waitForConfigRestartSettle(
   restartDelayMs = 1_000,
   timeoutMs = 60_000,
 ) {
-  await sleep(restartDelayMs + 750);
-  await waitForGatewayHealthy(env, timeoutMs);
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  const readyAfterMs = restartDelayMs + 750;
+  let lastHealthError: unknown = null;
+
+  while (Date.now() < deadline) {
+    try {
+      await waitForGatewayHealthy(env, Math.max(1, Math.min(1_000, deadline - Date.now())));
+      if (Date.now() - startedAt >= readyAfterMs) {
+        const remainingMs = Math.max(1, deadline - Date.now());
+        await waitForTransportReady(env, remainingMs);
+        return;
+      }
+    } catch (error) {
+      lastHealthError = error;
+    }
+    await sleep(Math.min(250, Math.max(1, deadline - Date.now())));
+  }
+
+  throw new Error(
+    `timed out after ${timeoutMs}ms waiting for config restart readiness${
+      lastHealthError ? `: ${formatErrorMessage(lastHealthError)}` : ""
+    }`,
+  );
 }
 
 function formatGatewayPrimaryErrorText(error: unknown) {
@@ -178,6 +200,32 @@ function areJsonValuesEqual(left: unknown, right: unknown): boolean {
   return false;
 }
 
+function withoutQaConfigApplyVolatileFields(
+  config: Record<string, unknown>,
+): Record<string, unknown> {
+  const comparable = structuredClone(config);
+  // config.apply updates root metadata on write. Retries should not turn a
+  // completed apply into a metadata-only write/restart loop.
+  delete comparable.meta;
+  return comparable;
+}
+
+function isConfigApplyNoopForSnapshot(config: Record<string, unknown>, raw: string): boolean {
+  let nextConfig: unknown;
+  try {
+    nextConfig = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (!isPlainObject(nextConfig)) {
+    return false;
+  }
+  return areJsonValuesEqual(
+    withoutQaConfigApplyVolatileFields(config),
+    withoutQaConfigApplyVolatileFields(nextConfig),
+  );
+}
+
 function isConfigPatchNoopForSnapshot(config: Record<string, unknown>, raw: string): boolean {
   let patch: unknown;
   try {
@@ -231,6 +279,12 @@ async function runConfigMutation(params: {
       // QA scenarios do best-effort cleanup in finally blocks. Skipping
       // client-known no-op patches keeps that cleanup from burning the
       // control-plane write budget and making later capability checks flaky.
+      return { ok: true, noop: true };
+    }
+    if (
+      params.action === "config.apply" &&
+      isConfigApplyNoopForSnapshot(snapshot.config, params.raw)
+    ) {
       return { ok: true, noop: true };
     }
     try {
@@ -325,14 +379,12 @@ async function applyConfig(params: {
 export {
   applyConfig,
   fetchJson,
-  formatGatewayPrimaryErrorText,
   getGatewayRetryAfterMs,
+  isConfigApplyNoopForSnapshot,
   isConfigPatchNoopForSnapshot,
   isConfigHashConflict,
-  isGatewayRestartRace,
   patchConfig,
   readConfigSnapshot,
-  runConfigMutation,
   waitForConfigRestartSettle,
   waitForGatewayHealthy,
   waitForQaChannelReady,

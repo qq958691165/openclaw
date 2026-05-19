@@ -1,24 +1,28 @@
 import path from "node:path";
-import { resolveCanvasHttpPathToLocalPath } from "../gateway/canvas-documents.js";
 import { logVerbose, shouldLogVerbose } from "../globals.js";
-import { SafeOpenError, readLocalFileSafely } from "../infra/fs-safe.js";
+import { formatErrorMessage } from "../infra/errors.js";
+import { FsSafeError, readLocalFileSafely } from "../infra/fs-safe.js";
 import { assertNoWindowsNetworkPath, safeFileURLToPath } from "../infra/local-file-access.js";
 import type { PinnedDispatcherPolicy, SsrFPolicy } from "../infra/net/ssrf.js";
+import { getActivePluginRegistry } from "../plugins/runtime.js";
 import { resolveUserPath } from "../utils.js";
 import { maxBytesForKind, type MediaKind } from "./constants.js";
-import { fetchRemoteMedia } from "./fetch.js";
-import {
-  convertHeicToJpeg,
-  hasAlphaChannel,
-  optimizeImageToPng,
-  resizeToJpeg,
-} from "./image-ops.js";
+import { readRemoteMediaBuffer } from "./fetch.js";
+import { basenameFromAnyPath, extnameFromAnyPath } from "./file-name.js";
 import {
   assertLocalMediaAllowed,
   getDefaultLocalRoots,
   LocalMediaAccessError,
   type LocalMediaAccessErrorCode,
 } from "./local-media-access.js";
+import { MediaReferenceError, resolveInboundMediaReference } from "./media-reference.js";
+import {
+  convertHeicToJpeg,
+  hasAlphaChannel,
+  isImageProcessorUnavailableError,
+  optimizeImageToPng,
+  resizeToJpeg,
+} from "./media-services.js";
 import {
   detectMime,
   extensionForMime,
@@ -27,7 +31,6 @@ import {
   mimeTypeFromFilePath,
   normalizeMimeType,
 } from "./mime.js";
-import { resolveMediaBufferPath } from "./store.js";
 
 export { getDefaultLocalRoots, LocalMediaAccessError };
 export type { LocalMediaAccessErrorCode };
@@ -58,43 +61,36 @@ type WebMediaOptions = {
 };
 
 async function resolveMediaStoreUriToPath(mediaUrl: string): Promise<string | null> {
-  if (!mediaUrl.startsWith("media://")) {
+  if (!/^media:\/\//i.test(mediaUrl)) {
     return null;
   }
-  let parsed: URL;
   try {
-    parsed = new URL(mediaUrl);
+    return (await resolveInboundMediaReference(mediaUrl))?.physicalPath ?? null;
   } catch (err) {
-    throw new LocalMediaAccessError("invalid-path", `Invalid media URI: ${mediaUrl}`, {
-      cause: err,
-    });
+    if (err instanceof MediaReferenceError) {
+      throw new LocalMediaAccessError(err.code, err.message, { cause: err });
+    }
+    throw err;
   }
-  if (parsed.hostname !== "inbound") {
-    throw new LocalMediaAccessError(
-      "path-not-allowed",
-      `Unsupported media URI location: ${parsed.hostname || "(missing)"}`,
-    );
+}
+
+async function resolveHostedPluginMediaUrl(mediaUrl: string): Promise<string | null> {
+  const registry = getActivePluginRegistry();
+  for (const entry of registry?.hostedMediaResolvers ?? []) {
+    try {
+      const resolved = await entry.resolver(mediaUrl);
+      if (typeof resolved === "string" && resolved.trim()) {
+        return resolved;
+      }
+    } catch (err) {
+      if (shouldLogVerbose()) {
+        logVerbose(
+          `Hosted media resolver failed (${entry.pluginId ?? "unknown"}): ${formatErrorMessage(err)}`,
+        );
+      }
+    }
   }
-  let id: string;
-  try {
-    id = decodeURIComponent(parsed.pathname.replace(/^\/+/, ""));
-  } catch (err) {
-    throw new LocalMediaAccessError("invalid-path", `Invalid media URI: ${mediaUrl}`, {
-      cause: err,
-    });
-  }
-  if (!id || id.includes("/")) {
-    throw new LocalMediaAccessError("invalid-path", `Invalid media URI: ${mediaUrl}`);
-  }
-  try {
-    return await resolveMediaBufferPath(id, "inbound");
-  } catch (err) {
-    throw new LocalMediaAccessError(
-      "invalid-path",
-      err instanceof Error ? err.message : `Invalid media URI: ${mediaUrl}`,
-      { cause: err },
-    );
-  }
+  return null;
 }
 
 function resolveWebMediaOptions(params: {
@@ -129,6 +125,10 @@ const HOST_READ_ALLOWED_DOCUMENT_MIMES = new Set([
   "application/vnd.openxmlformats-officedocument.presentationml.presentation",
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/gzip",
+  "application/x-7z-compressed",
+  "application/x-tar",
+  "application/zip",
   "text/csv",
   "text/markdown",
 ]);
@@ -306,7 +306,7 @@ function assertHostReadMediaAllowed(params: {
   }
   throw new LocalMediaAccessError(
     "path-not-allowed",
-    `Host-local media sends only allow buffer-verified images, audio, video, PDF, and Office documents (got ${sniffedMime ?? normalizedMime ?? "unknown"}).`,
+    `Host-local media sends only allow buffer-verified images, audio, video, PDF, Office documents, archives, CSV, and Markdown (got ${sniffedMime ?? normalizedMime ?? "unknown"}).`,
   );
 }
 
@@ -314,7 +314,7 @@ function toJpegFileName(fileName?: string): string | undefined {
   if (!fileName) {
     return undefined;
   }
-  const trimmed = fileName.trim();
+  const trimmed = basenameFromAnyPath(fileName.trim());
   if (!trimmed) {
     return fileName;
   }
@@ -409,7 +409,7 @@ async function loadWebMediaInternal(
       throw new LocalMediaAccessError("invalid-file-url", (err as Error).message, { cause: err });
     }
   }
-  mediaUrl = resolveCanvasHttpPathToLocalPath(mediaUrl) ?? mediaUrl;
+  mediaUrl = (await resolveHostedPluginMediaUrl(mediaUrl)) ?? mediaUrl;
 
   const optimizeAndClampImage = async (
     buffer: Buffer,
@@ -417,7 +417,29 @@ async function loadWebMediaInternal(
     meta?: { contentType?: string; fileName?: string },
   ) => {
     const originalSize = buffer.length;
-    const optimized = await optimizeImageWithFallback({ buffer, cap, meta });
+    let optimized: OptimizedImage;
+    try {
+      optimized = await optimizeImageWithFallback({ buffer, cap, meta });
+    } catch (err) {
+      if (
+        isImageProcessorUnavailableError(err) &&
+        !isHeicSource(meta ?? {}) &&
+        buffer.length <= cap
+      ) {
+        if (shouldLogVerbose()) {
+          logVerbose(
+            `Image optimizer unavailable; sending original ${formatMb(buffer.length)}MB media without optimization`,
+          );
+        }
+        return {
+          buffer,
+          contentType: meta?.contentType,
+          kind: "image" as const,
+          fileName: meta?.fileName,
+        };
+      }
+      throw err;
+    }
     logOptimizedImage({ originalSize, optimized });
 
     if (optimized.buffer.length > cap) {
@@ -495,7 +517,7 @@ async function loadWebMediaInternal(
           allowPrivateProxy: true,
         }
       : undefined;
-    const fetched = await fetchRemoteMedia({
+    const fetched = await readRemoteMediaBuffer({
       url: mediaUrl,
       fetchImpl,
       requestInit,
@@ -544,7 +566,7 @@ async function loadWebMediaInternal(
     try {
       data = (await readLocalFileSafely({ filePath: mediaUrl })).buffer;
     } catch (err) {
-      if (err instanceof SafeOpenError) {
+      if (err instanceof FsSafeError) {
         if (err.code === "not-found") {
           throw new LocalMediaAccessError("not-found", `Local media file not found: ${mediaUrl}`, {
             cause: err,
@@ -578,8 +600,8 @@ async function loadWebMediaInternal(
       buffer: data,
     });
   }
-  let fileName = path.basename(mediaUrl) || undefined;
-  if (fileName && !path.extname(fileName) && mime) {
+  let fileName = basenameFromAnyPath(mediaUrl) || undefined;
+  if (fileName && !extnameFromAnyPath(fileName) && mime) {
     const ext = extensionForMime(mime);
     if (ext) {
       fileName = `${fileName}${ext}`;
@@ -642,6 +664,8 @@ export async function optimizeImageToJpeg(
     resizeSide: number;
     quality: number;
   } | null = null;
+  let firstResizeError: unknown;
+  const errors: string[] = [];
 
   for (const side of sides) {
     for (const quality of qualities) {
@@ -664,7 +688,12 @@ export async function optimizeImageToJpeg(
             quality,
           };
         }
-      } catch {
+      } catch (err) {
+        firstResizeError ??= err;
+        const message = formatErrorMessage(err).trim();
+        if (message && !errors.includes(message)) {
+          errors.push(message);
+        }
         // Continue trying other size/quality combinations
       }
     }
@@ -679,7 +708,12 @@ export async function optimizeImageToJpeg(
     };
   }
 
-  throw new Error("Failed to optimize image");
+  if (isImageProcessorUnavailableError(firstResizeError)) {
+    throw firstResizeError;
+  }
+
+  const detail = errors.length > 0 ? `: ${errors.slice(0, 3).join("; ")}` : "";
+  throw new Error(`Failed to optimize image${detail}`, { cause: firstResizeError });
 }
 
 export { optimizeImageToPng };

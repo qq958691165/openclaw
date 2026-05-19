@@ -1,6 +1,8 @@
+import type { SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { OpenClawStdioClientTransport } from "./mcp-stdio-transport.js";
 
 const spawnMock = vi.hoisted(() => vi.fn());
 const killProcessTreeMock = vi.hoisted(() => vi.fn());
@@ -32,7 +34,6 @@ describe("OpenClawStdioClientTransport", () => {
   it("starts stdio MCP servers in a disposable process group on POSIX", async () => {
     const child = new MockChildProcess();
     spawnMock.mockReturnValue(child);
-    const { OpenClawStdioClientTransport } = await import("./mcp-stdio-transport.js");
 
     const transport = new OpenClawStdioClientTransport({
       command: "npx",
@@ -45,16 +46,25 @@ describe("OpenClawStdioClientTransport", () => {
     child.emit("spawn");
     await started;
 
-    expect(spawnMock).toHaveBeenCalledWith(
-      "npx",
-      ["-y", "example-mcp"],
-      expect.objectContaining({
-        cwd: "/tmp/example",
-        detached: process.platform !== "win32",
-        shell: false,
-        stdio: ["pipe", "pipe", "pipe"],
-      }),
-    );
+    const [command, args, options] = spawnMock.mock.calls.at(0) as [string, string[], SpawnOptions];
+    if (process.platform === "linux") {
+      expect(command).toBe("/bin/sh");
+      expect(args).toEqual([
+        "-c",
+        'echo 1000 > /proc/self/oom_score_adj 2>/dev/null; exec "$0" "$@"',
+        "npx",
+        "-y",
+        "example-mcp",
+      ]);
+    } else {
+      expect(command).toBe("npx");
+      expect(args).toEqual(["-y", "example-mcp"]);
+    }
+    expect(options.cwd).toBe("/tmp/example");
+    expect(options.detached).toBe(process.platform !== "win32");
+    expect(options.shell).toBe(false);
+    expect(options.stdio).toEqual(["pipe", "pipe", "pipe"]);
+    expect(options.env?.EXAMPLE).toBe("1");
     expect(transport.pid).toBe(4321);
     expect(transport.stderr).toBeInstanceOf(PassThrough);
   });
@@ -63,7 +73,6 @@ describe("OpenClawStdioClientTransport", () => {
     vi.useFakeTimers();
     const child = new MockChildProcess();
     spawnMock.mockReturnValue(child);
-    const { OpenClawStdioClientTransport } = await import("./mcp-stdio-transport.js");
 
     const transport = new OpenClawStdioClientTransport({ command: "npx" });
     const started = transport.start();
@@ -83,7 +92,6 @@ describe("OpenClawStdioClientTransport", () => {
     vi.useFakeTimers();
     const child = new MockChildProcess();
     spawnMock.mockReturnValue(child);
-    const { OpenClawStdioClientTransport } = await import("./mcp-stdio-transport.js");
 
     const transport = new OpenClawStdioClientTransport({ command: "npx" });
     const started = transport.start();
@@ -101,7 +109,6 @@ describe("OpenClawStdioClientTransport", () => {
   it("sends and receives JSON-RPC messages over stdio", async () => {
     const child = new MockChildProcess();
     spawnMock.mockReturnValue(child);
-    const { OpenClawStdioClientTransport } = await import("./mcp-stdio-transport.js");
 
     const transport = new OpenClawStdioClientTransport({ command: "npx" });
     const onmessage = vi.fn();
@@ -119,5 +126,49 @@ describe("OpenClawStdioClientTransport", () => {
       id: 1,
       result: { ok: true },
     });
+  });
+
+  it("rejects send() with EPIPE when child stdin is closed (#75438)", async () => {
+    const child = new MockChildProcess();
+    const brokenStdin = new PassThrough();
+    brokenStdin.write = (_chunk: unknown, cbOrEncoding?: unknown, cb?: unknown) => {
+      const callback =
+        typeof cbOrEncoding === "function" ? cbOrEncoding : typeof cb === "function" ? cb : null;
+      const err = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+      if (callback) {
+        (callback as (err: Error) => void)(err);
+      }
+      return false;
+    };
+    child.stdin = brokenStdin;
+    spawnMock.mockReturnValue(child);
+
+    const transport = new OpenClawStdioClientTransport({ command: "npx" });
+    const started = transport.start();
+    child.emit("spawn");
+    await started;
+
+    await expect(transport.send({ jsonrpc: "2.0", id: 2, method: "ping" })).rejects.toThrow(
+      "EPIPE",
+    );
+  });
+
+  it("rejects send() when stdin.write throws synchronously (#75438)", async () => {
+    const child = new MockChildProcess();
+    const brokenStdin = new PassThrough();
+    brokenStdin.write = () => {
+      throw Object.assign(new Error("write after end"), { code: "ERR_STREAM_DESTROYED" });
+    };
+    child.stdin = brokenStdin;
+    spawnMock.mockReturnValue(child);
+
+    const transport = new OpenClawStdioClientTransport({ command: "npx" });
+    const started = transport.start();
+    child.emit("spawn");
+    await started;
+
+    await expect(transport.send({ jsonrpc: "2.0", id: 3, method: "ping" })).rejects.toThrow(
+      "write after end",
+    );
   });
 });

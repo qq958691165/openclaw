@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -13,14 +13,17 @@ import {
 
 const logLevel = process.env.OPENCLAW_BUILD_VERBOSE ? "info" : "warn";
 const extraArgs = process.argv.slice(2);
-const INEFFECTIVE_DYNAMIC_IMPORT_RE = /\[INEFFECTIVE_DYNAMIC_IMPORT\]/;
+const INEFFECTIVE_DYNAMIC_IMPORT_MARKER = "[INEFFECTIVE_DYNAMIC_IMPORT]";
 const UNRESOLVED_IMPORT_RE = /\[UNRESOLVED_IMPORT\]/;
 const ANSI_ESCAPE_RE = new RegExp(String.raw`\u001B\[[0-9;]*m`, "g");
 const HASHED_ROOT_JS_RE = /^(?<base>.+)-[A-Za-z0-9_-]+\.js$/u;
 const DEFAULT_CAPTURE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_HEARTBEAT_MS = 30_000;
+const DEFAULT_TSDOWN_NODE_OPTIONS = "--max-old-space-size=6144";
 const TERMINATION_GRACE_MS = 5_000;
 const TSDOWN_OUTPUT_ROOTS = ["dist", "dist-runtime"];
+const GENERATED_SOURCE_DECLARATION_PATHSPEC = ":(glob)extensions/**/*.d.ts";
+const SOURCE_DECLARATION_SOURCE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs"];
 
 function removeDistPluginNodeModulesSymlinks(rootDir) {
   const extensionsDir = path.join(rootDir, "extensions");
@@ -93,6 +96,52 @@ export function pruneStaleRootChunkFiles(params = {}) {
   }
 }
 
+export function pruneUntrackedGeneratedSourceDeclarations(params = {}) {
+  const cwd = params.cwd ?? process.cwd();
+  const fsImpl = params.fs ?? fs;
+  const spawnSyncImpl = params.spawnSync ?? spawnSync;
+  let result;
+  try {
+    result = spawnSyncImpl(
+      "git",
+      ["ls-files", "--others", "--exclude-standard", "--", GENERATED_SOURCE_DECLARATION_PATHSPEC],
+      {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+  } catch {
+    return 0;
+  }
+  if (result.status !== 0 || typeof result.stdout !== "string") {
+    return 0;
+  }
+
+  let removed = 0;
+  for (const rawPath of result.stdout.split(/\r?\n/u)) {
+    const relativePath = rawPath.trim().replaceAll("\\", "/");
+    if (!relativePath.startsWith("extensions/") || !relativePath.endsWith(".d.ts")) {
+      continue;
+    }
+    const declarationPath = path.join(cwd, relativePath);
+    const sourceBase = declarationPath.slice(0, -".d.ts".length);
+    const hasMatchingSource = SOURCE_DECLARATION_SOURCE_EXTENSIONS.some((extension) =>
+      fsImpl.existsSync(`${sourceBase}${extension}`),
+    );
+    if (!hasMatchingSource) {
+      continue;
+    }
+    try {
+      fsImpl.rmSync(declarationPath, { force: true });
+      removed += 1;
+    } catch {
+      // Best-effort cleanup; tsdown will still report any remaining stale files.
+    }
+  }
+  return removed;
+}
+
 export function pruneSourceCheckoutBundledPluginNodeModules(params = {}) {
   const cwd = params.cwd ?? process.cwd();
   const logger = params.logger ?? console;
@@ -151,6 +200,19 @@ function parseNonNegativeInteger(value) {
   return Math.trunc(parsed);
 }
 
+function resolveTsdownEnv(env) {
+  const nodeOptions = env.NODE_OPTIONS?.trim() ?? "";
+  if (/(?:^|\s)--max-old-space-size(?:=|\s+)/u.test(nodeOptions)) {
+    return env;
+  }
+  return {
+    ...env,
+    NODE_OPTIONS: nodeOptions
+      ? `${nodeOptions} ${DEFAULT_TSDOWN_NODE_OPTIONS}`
+      : DEFAULT_TSDOWN_NODE_OPTIONS,
+  };
+}
+
 export function createTsdownOutputScanner(params = {}) {
   const maxCaptureBytes = params.maxCaptureBytes ?? DEFAULT_CAPTURE_BYTES;
   let captured = "";
@@ -170,7 +232,7 @@ export function createTsdownOutputScanner(params = {}) {
   return {
     append(chunk) {
       const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-      if (INEFFECTIVE_DYNAMIC_IMPORT_RE.test(text)) {
+      if (text.includes(INEFFECTIVE_DYNAMIC_IMPORT_MARKER)) {
         hasIneffectiveDynamicImport = true;
       }
       scanLines(text);
@@ -194,7 +256,7 @@ export function createTsdownOutputScanner(params = {}) {
 }
 
 export function resolveTsdownBuildInvocation(params = {}) {
-  const env = params.env ?? process.env;
+  const env = resolveTsdownEnv(params.env ?? process.env);
   const runner = resolvePnpmRunner({
     pnpmArgs: [
       "exec",
@@ -326,6 +388,7 @@ function isMainModule() {
 
 if (isMainModule()) {
   pruneSourceCheckoutBundledPluginNodeModules();
+  pruneUntrackedGeneratedSourceDeclarations();
   pruneStaleRuntimeSymlinks();
   cleanTsdownOutputRoots();
   const invocation = resolveTsdownBuildInvocation();
